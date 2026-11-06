@@ -100,11 +100,27 @@ ssh -i <key> -o IdentitiesOnly=yes -p <publicPort> root@<ip>
 2. **Deployments fail transiently** with `There are no longer any instances available...` — retry the same `create_pod` with backoff; usually succeeds within 1–3 attempts.
 3. **Image-pull speed is a host lottery** (same tag: 5 min to 60+ min stuck). `uptimeSeconds` can stay `0` even while the container runs — it is NOT a reliable health signal. Use `runtime.ports` appearing as the boot signal.
 4. **SSH key auth is also a host lottery**: identical image + identical `PUBLIC_KEY` env, one host accepts, another rejects (`Permission denied (publickey,password)`). If rejected for >10 min after ports appear: terminate and recreate (new host), and/or add a self-healing first command.
-5. **Self-healing startup** (fixes authorized_keys races) — via `docker_args`. Shell form you want on the container:
-   `mkdir -p /root/.ssh && python3 -c "import os;open('/root/.ssh/authorized_keys','w').write(os.environ.get('PUBLIC_KEY',''))" && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && (service ssh start || /usr/sbin/sshd) && bash /root/pipeline.sh`
-   SDK form (inner `"` escaped as `\"` for GraphQL, then runpod image turns it back into shell quotes):
-   `docker_args = 'mkdir -p /root/.ssh && python3 -c "import os;open(\'/root/.ssh/authorized_keys\',\'w\').write(os.environ.get(\'PUBLIC_KEY\',\'\'))" && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && (service ssh start || /usr/sbin/sshd) && bash /root/pipeline.sh'`
-   Keep long pipelines in a script fetched from a trusted URL (e.g. your private HF repo via `$HF_TOKEN`) instead of growing this string.
+5. **Self-healing startup** — `docker_args` is SHLEX-SPLIT into argv (see gotcha #15), so use a single `python3 -c` command:
+
+```python
+CODE = ("import os,urllib.request as u;"
+        "open('/root/.ssh/authorized_keys','w').write(os.environ.get('PUBLIC_KEY',''));"
+        "os.chmod('/root/.ssh',0o700);os.chmod('/root/.ssh/authorized_keys',0o600);"
+        "open('/root/pipeline.sh','wb').write(u.urlopen(u.Request("
+        "'https://huggingface.co/<user>/<repo>/resolve/main/pipeline.sh',"
+        "headers={'Authorization':'Bearer '+os.environ.get('HF_TOKEN','')})).read());"
+        "os.system('(service ssh start || /usr/sbin/sshd) >/dev/null 2>&1 &');"
+        "os.system('nohup bash /root/pipeline.sh >/root/pipeline.log 2>&1 &');"
+        "os.system('nohup python3 -m http.server 8000 --directory /root >/dev/null 2>&1 &');"
+        "os.system('tail -f /dev/null')")
+# CODE uses single quotes only; wrap in double quotes GraphQL-escaped as \"
+docker_args = 'python3 -c \"' + CODE + '\"'
+# RunPod decodes to ["python3","-c",CODE], which: fixes authorized_keys,
+# self-hosts the pipeline from your private HF repo, starts sshd,
+# runs the pipeline headless, and serves /root on :8000 for monitoring
+```
+
+This pattern gives three independent channels: SSH (fixed keys), HTTP proxy `:8000/pipeline.log` (live progress), and HF upload (final artifacts).
 6. **NAT hosts**: when `runtime.ports[].isIpPublic` is `false`, direct TCP is impossible. Use RunPod proxies instead:
    - SSH: `ssh -p 22 root@<pod_id>.ssh.proxy.runpod.net` (works only if 22 is mapped AND sshd is up)
    - HTTP port N: `https://<pod_id>-<publicPort>.proxy.runpod.net/` (404 from the proxy itself = backend down, not a real app 404)
@@ -199,7 +215,7 @@ Behavior knobs you can set: `RUNPOD_LOG_LEVEL` / `RUNPOD_DEBUG_LEVEL`, `RUNPOD_S
 12. **`uptimeSeconds` can stay 0 on running pods** — never use it as a health check; watch `runtime.ports` instead.
 13. **Host lottery is real**: same tag/image/keys behaved differently across hosts (pull time 5→60 min; SSH key accepted vs rejected). Don't debug for more than ~15 min — terminate and recreate on a new host.
 14. **Image re-push can platform-wide break SSH** (happened 2026-10-30 20:07 UTC). Check Docker Hub `last_updated` for your tag when auth suddenly fails everywhere.
-15. **`docker_args`/`env` values are injected into GraphQL without escaping** — escape `"` yourself; official `pytorch/pytorch` images run docker_args exec-form (inline scripts silently crash-loop), `runpod/*` images run shell-form.
+15. **`docker_args`/`env` values are injected into GraphQL without escaping** — escape `"` yourself (`\"` in the string). **`docker_args` is SHLEX-SPLIT on spaces into an argv array** (verified on runpod/pytorch, runpod/stack, pytorch/pytorch): multi-command strings crash-loop on EVERY image (`mkdir -p x && python3 ...` becomes argv `["mkdir","-p","x","&&","python3",...]` → literal junk dirs → exit → restart loop, ports never map). Only single-command forms work — the reliable pattern is `python3 -c "<code>"` with code in single quotes (see playbook #5). `shlex.quote(CODE)` is UNSAFE here: it wraps single quotes as `'"'"'` which breaks GraphQL.
 
 ## Calling a serverless endpoint (sync client, verified signature)
 
